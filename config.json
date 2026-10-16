@@ -1,0 +1,15 @@
+{
+    "ServiceName": "dpi-bypass-winws",
+    "TaskName": "dpi-bypass-health",
+    "ReselectTaskName": "dpi-bypass-reselect",
+    "DnsV4": [ "1.1.1.1", "1.0.0.1" ],
+    "DnsV6": [ "2606:4700:4700::1111", "2606:4700:4700::1001" ],
+    "DohTemplate": "https://cloudflare-dns.com/dns-query",
+    "CheckTargets": [ "https://discord.com/", "https://gateway.discord.gg/" ],
+    "ControlTarget": "https://www.google.com/",
+    "WinwsRestartAfterMinutes": 2,
+    "WinwsRestartCooldownMinutes": 5,
+    "ReselectAfterRestarts": 2,
+    "ReselectCooldownMinutes": 30,
+    "LogRetentionDays": 14
+}
