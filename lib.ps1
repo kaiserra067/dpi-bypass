@@ -40,14 +40,34 @@ $Strategies = [ordered]@{
     'multisplit'                 = @('--dpi-desync=multisplit', '--dpi-desync-split-pos=1,midsld')
 }
 
-# Discord uygulamasinin actigi baglantilar. Guncelleyici TLS 1.2 kullanir; ikisi de gecmeli.
-$DiscordChecks = @(
-    @{ Url = 'https://discord.com/';         Tls12 = $false }
-    @{ Url = 'https://gateway.discord.gg/';  Tls12 = $false }
-    @{ Url = 'https://updates.discord.com/'; Tls12 = $true }
-    @{ Url = 'https://discord.com/';         Tls12 = $true }
-    @{ Url = 'https://cdn.discordapp.com/';  Tls12 = $false }
-)
+# Her hizmet icin strateji ayri secilir: Discord (Cloudflare) ile Roblox (kendi sunuculari + Akamai) farkli DPI
+# yontemlerine farkli tepki verebilir. Her grubun tum adresleri gecmeli.
+$Checks = [ordered]@{
+    # Discord guncelleyicisi TLS 1.2 kullanir; ikisi de gecmeli.
+    Discord = @(
+        @{ Url = 'https://discord.com/';         Tls12 = $false }
+        @{ Url = 'https://gateway.discord.gg/';  Tls12 = $false }
+        @{ Url = 'https://updates.discord.com/'; Tls12 = $true }
+        @{ Url = 'https://discord.com/';         Tls12 = $true }
+        @{ Url = 'https://cdn.discordapp.com/';  Tls12 = $false }
+    )
+    # rbxcdn.com (Akamai) oyun dosyalarini (c0-c7), gorselleri (t0-t7, tr) ve sitenin js/css'ini tasir.
+    # Engellenirse uygulama acilir ama oyuna girilemez, site de yuklenmez.
+    Roblox = @(
+        @{ Url = 'https://www.roblox.com/';      Tls12 = $false }
+        @{ Url = 'https://gamejoin.roblox.com/'; Tls12 = $false }
+        @{ Url = 'https://c0.rbxcdn.com/';       Tls12 = $false }
+        @{ Url = 'https://tr.rbxcdn.com/';       Tls12 = $false }
+        @{ Url = 'https://js.rbxcdn.com/';       Tls12 = $false }
+        @{ Url = 'https://setup.rbxcdn.com/';    Tls12 = $true }
+    )
+}
+$HostLists = [ordered]@{ Discord = 'hostlist.txt'; Roblox = 'hostlist-roblox.txt' }
+
+# Roblox oyun sunuculari (AS22697). Oyun trafigi bu adreslere 49152-65535 UDP portlarindan gider;
+# baglantinin ilk paketlerinden once sahte paket gonderilir.
+$RobloxGameNets  = @('128.116.0.0/17', '103.140.28.0/23', '141.193.3.0/24', '205.201.62.0/24', '2620:2b:e000::/48', '2620:135:6000::/40')
+$RobloxGameFilter = Join-Path $InstallDir 'windivert_part.roblox_game.txt'
 
 # Ayni anda WinDivert kullanan diger DPI araclari (calisirlarsa birbirini bozar).
 $ConflictPattern = '(?i)\\(winws|goodbyedpi)\.exe'
@@ -96,15 +116,19 @@ function Test-Url([string]$Url, [switch]$Tls12, [int]$TimeoutSec = 6) {
     $LASTEXITCODE -eq 0
 }
 
-function Test-Discord([switch]$StopOnFail) {
+function Test-Group([string]$Group, [switch]$StopOnFail) {
     $passed = 0; $failed = @()
-    foreach ($c in $DiscordChecks) {
+    foreach ($c in $Checks[$Group]) {
         $ok = Test-Url $c.Url -Tls12:$c.Tls12
         if (-not $ok) { Start-Sleep -Milliseconds 800; $ok = Test-Url $c.Url -Tls12:$c.Tls12 }
         $label = $c.Url + $(if ($c.Tls12) { ' [TLS1.2]' } else { '' })
         if ($ok) { $passed++ } else { $failed += $label; if ($StopOnFail) { break } }
     }
-    [pscustomobject]@{ Passed = $passed; Total = $DiscordChecks.Count; Failed = $failed }
+    [pscustomobject]@{ Group = $Group; Passed = $passed; Total = @($Checks[$Group]).Count; Failed = $failed }
+}
+function Test-AllGroups { foreach ($g in $Checks.Keys) { Test-Group $g } }
+function Format-GroupResult($r) {
+    '{0} {1}/{2}{3}' -f $r.Group, $r.Passed, $r.Total, $(if ($r.Failed) { " (basarisiz: $($r.Failed -join ', '))" } else { '' })
 }
 
 # Sistem DNS'inin discord.com icin verdigi adresleri Cloudflare DoH'un verdikleriyle karsilastirir.
@@ -125,24 +149,68 @@ function Test-DnsPoison([string]$Name = 'discord.com') {
 }
 
 # --- winws ----------------------------------------------------------------------
-function Get-WinwsArgString([string[]]$TcpArgs) {
+# CIDR -> WinDivert filtresi icin ilk ve son adres.
+function Get-CidrRange([string]$Cidr) {
+    $ip, $len = $Cidr -split '/'
+    $lo = ([Net.IPAddress]::Parse($ip)).GetAddressBytes(); $hi = [byte[]]$lo.Clone()
+    for ($i = 0; $i -lt $lo.Length; $i++) {
+        $bits = [Math]::Max(0, [Math]::Min(8, [int]$len - 8 * $i))
+        $mask = (0xFF -shl (8 - $bits)) -band 0xFF
+        $lo[$i] = $lo[$i] -band $mask
+        $hi[$i] = $lo[$i] -bor (0xFF -bxor $mask)
+    }
+    [Net.IPAddress]::new($lo).ToString(), [Net.IPAddress]::new($hi).ToString()
+}
+
+# Yalnizca Roblox oyun sunucularina giden UDP paketleri winws'e yonlendirilir (tum yuksek portlari
+# yakalamak diger oyunlari ve torrent'i yavaslatir). Kurulum klasorune yazilir; YONETICI gerekir.
+function Write-RobloxGameFilter {
+    $nets = foreach ($n in $RobloxGameNets) {
+        $lo, $hi = Get-CidrRange $n
+        $f = if ($n -match ':') { 'ipv6' } else { 'ip' }
+        "    $f.DstAddr>=$lo and $f.DstAddr<=$hi"
+    }
+    @('  outbound and udp.DstPort>=49152 and', '  (', ($nets -join " or`n"), '  )') |
+        Set-Content -Path $RobloxGameFilter -Encoding ASCII
+}
+
+function Get-WinwsArgString([string[]]$DiscordArgs, [string[]]$RobloxArgs) {
     $bin = Join-Path $InstallDir 'bin'
-    $hl  = '"' + (Join-Path $InstallDir 'hostlist.txt') + '"'
+    $hl  = '"' + (Join-Path $InstallDir $HostLists.Discord) + '"'
+    $rhl = '"' + (Join-Path $InstallDir $HostLists.Roblox) + '"'
     $a = @('--wf-tcp=80,443', '--wf-udp=443',
-           ('--wf-raw-part=@"' + (Join-Path $bin 'windivert.filter\windivert_part.discord_media.txt') + '"'),
-           '--filter-tcp=80,443', "--hostlist=$hl") + $TcpArgs +
-         @('--new', '--filter-udp=443', "--hostlist=$hl", '--dpi-desync=fake', '--dpi-desync-repeats=6',
-           ('--dpi-desync-fake-quic="' + (Join-Path $bin 'files\quic_initial_www_google_com.bin') + '"'),
-           '--new', '--filter-l7=discord', '--dpi-desync=fake', '--dpi-desync-repeats=6')
+           ('--wf-raw-part=@"' + (Join-Path $bin 'windivert.filter\windivert_part.discord_media.txt') + '"'))
+    if ($Cfg.RobloxGameUdp) { $a += '--wf-raw-part=@"' + $RobloxGameFilter + '"' }
+    $a += @('--filter-tcp=80,443', "--hostlist=$rhl") + $RobloxArgs +
+          @('--new', '--filter-tcp=80,443', "--hostlist=$hl") + $DiscordArgs +
+          @('--new', '--filter-udp=443', "--hostlist=$hl", "--hostlist=$rhl", '--dpi-desync=fake', '--dpi-desync-repeats=6',
+            ('--dpi-desync-fake-quic="' + (Join-Path $bin 'files\quic_initial_www_google_com.bin') + '"'),
+            '--new', '--filter-l7=discord', '--dpi-desync=fake', '--dpi-desync-repeats=6')
+    # Roblox oyun trafigi (RakNet, UDP). cutoff: yalnizca baglantinin ilk paketlerinden once sahte paket.
+    if ($Cfg.RobloxGameUdp) {
+        $a += @('--new', '--filter-udp=49152-65535', "--ipset-ip=$($RobloxGameNets -join ',')", '--dpi-desync=fake',
+                '--dpi-desync-any-protocol=1', '--dpi-desync-fake-unknown-udp=0x00', '--dpi-desync-repeats=10', '--dpi-desync-cutoff=n2')
+    }
     $a -join ' '
 }
 
+# Doner: @{ Discord = <strateji>; Roblox = <strateji> } (bilinmeyenler $null). Eski (tek stratejili) kayitta Name = Discord.
 function Get-SavedStrategy {
-    if (Test-Path $StrategyPath) { try { return (Get-Content $StrategyPath -Raw | ConvertFrom-Json).Name } catch { } }
-    $null
+    $s = [ordered]@{}; foreach ($g in $Checks.Keys) { $s[$g] = $null }
+    if (Test-Path $StrategyPath) {
+        try {
+            $j = Get-Content $StrategyPath -Raw | ConvertFrom-Json
+            foreach ($g in $Checks.Keys) { if ($j.$g -and $Strategies.Contains([string]$j.$g)) { $s[$g] = [string]$j.$g } }
+            if (-not $s.Discord -and $j.Name -and $Strategies.Contains([string]$j.Name)) { $s.Discord = [string]$j.Name }
+        } catch { }
+    }
+    $s
 }
-function Save-Strategy([string]$Name) {
-    [ordered]@{ Name = $Name; Selected = (Get-Date).ToString('s') } | ConvertTo-Json | Set-Content -Path $StrategyPath -Encoding UTF8
+function Format-Strategy($s) { (@($s.Keys) | ForEach-Object { '{0}={1}' -f $_, $(if ($s[$_]) { $s[$_] } else { '-' }) }) -join ' ' }
+function Save-Strategy($s) {
+    $o = [ordered]@{}; foreach ($g in $Checks.Keys) { $o[$g] = $s[$g] }
+    $o.Selected = (Get-Date).ToString('s')
+    $o | ConvertTo-Json | Set-Content -Path $StrategyPath -Encoding UTF8
 }
 
 function Stop-WinDivertDriver {
@@ -167,16 +235,21 @@ function Get-ConflictProcesses {
 }
 
 # Stratejileri winws'i gecici olarak calistirip dener. Kurulu hizmet ve diger DPI araclari DURMUS olmali.
-# Doner: tum testleri gecen ilk strateji; yoksa en cok testi gecen; hic yoksa $null.
+# Her grup (Discord, Roblox) icin ayri secim yapilir; her strateji bir kez calistirilip henuz bulunamayan gruplar test edilir.
+# Doner: grup basina tum testleri gecen ilk strateji; yoksa en cok testi gecen; hic yoksa $null.
 function Find-Strategy {
     $winws = Join-Path $InstallDir 'bin\winws.exe'
-    $names = @($Strategies.Keys)
     $saved = Get-SavedStrategy
-    if ($saved -and $Strategies.Contains($saved)) { $names = @($saved) + @($names | Where-Object { $_ -ne $saved }) }
-    $best = $null; $bestScore = 0
+    $first = @($saved.Values | Where-Object { $_ } | Select-Object -Unique)
+    $names = @($first) + @($Strategies.Keys | Where-Object { $first -notcontains $_ })
+    $found = [ordered]@{}; $best = @{}
+    foreach ($g in $Checks.Keys) { $found[$g] = $null; $best[$g] = @{ Name = $null; Score = 0 } }
+    if ($Cfg.RobloxGameUdp) { Write-RobloxGameFilter }
     foreach ($n in $names) {
+        $todo = @($Checks.Keys | Where-Object { -not $found[$_] })
+        if (-not $todo) { break }
         $out = Join-Path $LogDir "winws-test-$n.log"
-        $p = Start-Process -FilePath $winws -ArgumentList (Get-WinwsArgString $Strategies[$n]) -WorkingDirectory (Split-Path $winws) `
+        $p = Start-Process -FilePath $winws -ArgumentList (Get-WinwsArgString $Strategies[$n] $Strategies[$n]) -WorkingDirectory (Split-Path $winws) `
             -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError "$out.err"
         Start-Sleep -Seconds 2
         if ($p.HasExited) {
@@ -184,20 +257,31 @@ function Find-Strategy {
             Log ("  {0,-28} winws hemen kapandi (kod {1}) {2}" -f $n, $p.ExitCode, $err)
             continue
         }
-        $r = Test-Discord -StopOnFail
+        $results = foreach ($g in $todo) { Test-Group $g -StopOnFail }
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
         [void]$p.WaitForExit(5000)
-        Log ("  {0,-28} {1}/{2}{3}" -f $n, $r.Passed, $r.Total, $(if ($r.Failed) { "  basarisiz: $($r.Failed -join ', ')" } else { '' }))
-        if ($r.Passed -eq $r.Total) { return $n }
-        if ($r.Passed -gt $bestScore) { $best = $n; $bestScore = $r.Passed }
+        Log ("  {0,-28} {1}" -f $n, (@($results | ForEach-Object { Format-GroupResult $_ }) -join '  '))
+        foreach ($r in $results) {
+            if ($r.Passed -eq $r.Total) { $found[$r.Group] = $n }
+            elseif ($r.Passed -gt $best[$r.Group].Score) { $best[$r.Group] = @{ Name = $n; Score = $r.Passed } }
+        }
     }
-    if ($best) { Log "UYARI: Hicbir strateji tum testleri gecemedi. En iyi sonuc: $best ($bestScore/$($DiscordChecks.Count))." }
-    $best
+    foreach ($g in $Checks.Keys) {
+        if ($found[$g]) { continue }
+        $found[$g] = $best[$g].Name
+        if ($found[$g]) { Log "UYARI: $g icin hicbir strateji tum testleri gecemedi. En iyi sonuc: $($found[$g]) ($($best[$g].Score)/$(@($Checks[$g]).Count))." }
+    }
+    $found
 }
 
-# Hizmeti verilen stratejiyle kurar ya da komut satirini gunceller (baslatmaz).
-function Set-WinwsService([string]$Strategy) {
-    $image = '"' + (Join-Path $InstallDir 'bin\winws.exe') + '" ' + (Get-WinwsArgString $Strategies[$Strategy])
+# Hizmeti verilen stratejilerle (Get-SavedStrategy bicimi) kurar ya da komut satirini gunceller (baslatmaz).
+# Bilinmeyen grup icin ilk strateji kullanilir.
+function Set-WinwsService($Strategy) {
+    $default = @($Strategies.Keys)[0]
+    $d = if ($Strategy.Discord) { $Strategy.Discord } else { $default }
+    $r = if ($Strategy.Roblox) { $Strategy.Roblox } else { $default }
+    if ($Cfg.RobloxGameUdp) { Write-RobloxGameFilter }
+    $image = '"' + (Join-Path $InstallDir 'bin\winws.exe') + '" ' + (Get-WinwsArgString $Strategies[$d] $Strategies[$r])
     $name = $Cfg.ServiceName
     $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
     if ($svc) {
@@ -205,7 +289,7 @@ function Set-WinwsService([string]$Strategy) {
         Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$name" -Name ImagePath -Value $image
     } else {
         New-Service -Name $name -BinaryPathName $image -DisplayName 'DPI Bypass (zapret winws)' `
-            -Description "Discord icin DPI bypass. Kaldirmak icin: $InstallDir\uninstall.cmd" -StartupType Automatic | Out-Null
+            -Description "Discord ve Roblox icin DPI bypass. Kaldirmak icin: $InstallDir\uninstall.cmd" -StartupType Automatic | Out-Null
         & sc.exe failure $name reset= 86400 actions= restart/5000/restart/10000/restart/30000 | Out-Null
         & sc.exe failureflag $name 1 | Out-Null
     }

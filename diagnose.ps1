@@ -1,5 +1,5 @@
 <#
-  diagnose.ps1 - Discord neden acilmiyor? Durumu kontrol edip bir rapor yazar (YONETICI gerekir).
+  diagnose.ps1 - Discord / Roblox neden acilmiyor? Durumu kontrol edip bir rapor yazar (YONETICI gerekir).
   En kolay yol: diagnose.cmd'ye cift tiklayin. Hicbir ayari degistirmez.
   Rapor: C:\ProgramData\dpi-bypass\logs\diagnose-*.txt
 #>
@@ -24,7 +24,8 @@ W "Klasor       : $(if (Test-Path $InstallDir) { $InstallDir } else { 'YOK' })"
 W "Hizmet       : $(if ($svc) { "$($svc.Status) / $($svc.StartType)" } else { 'YOK' })"
 W "winws        : $(@(Get-Process -Name winws -ErrorAction SilentlyContinue | ForEach-Object { "PID $($_.Id) $($_.Path)" }) -join '; ')"
 W "WinDivert    : $(Get-Service -Name WinDivert -ErrorAction SilentlyContinue | ForEach-Object { $_.Status })"
-W "Strateji     : $(Get-SavedStrategy)"
+W "Strateji     : $(Format-Strategy (Get-SavedStrategy))"
+W "Roblox oyun  : $(if ($Cfg.RobloxGameUdp) { 'UDP acik' } else { 'UDP kapali (config.json: RobloxGameUdp)' })"
 foreach ($t in $Cfg.TaskName, $Cfg.ReselectTaskName) {
     $task = Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
     W ("Gorev        : {0} {1}" -f $t, $(if ($task) { $task.State } else { 'YOK' }))
@@ -35,6 +36,10 @@ if (Test-Path $InstallDir) {
     $bad = Test-BinFiles $InstallDir
     W "Dosyalar     : $(if ($bad) { 'SORUNLU: ' + ($bad -join ', ') } else { 'tam' })"
     if ($bad) { Problem "Program dosyalari eksik/bozuk ($($bad -join ', ')). Antivirus silmis olabilir; istisna ekleyip yeniden kurun." }
+    $missing = @($HostLists.Values | Where-Object { -not (Test-Path (Join-Path $InstallDir $_)) })
+    if ($Cfg.RobloxGameUdp -and -not (Test-Path $RobloxGameFilter)) { $missing += Split-Path $RobloxGameFilter -Leaf }
+    W "Listeler     : $(if ($missing) { 'EKSIK: ' + ($missing -join ', ') } else { 'tam' })"
+    if ($missing) { Problem "Kurulum eksik ($($missing -join ', ')); eski surumden kalmis olabilir. install.cmd'yi yeniden calistirin." }
 }
 
 Section 'Catisan DPI araclari'
@@ -76,20 +81,25 @@ if (Get-Command Get-DnsClientDohServerAddress -ErrorAction SilentlyContinue) {
         W ("DoH {0,-24} {1}" -f $s, $(if ($d) { "AutoUpgrade=$($d.AutoUpgrade) Fallback=$($d.AllowFallbackToUdp)" } else { 'tanimli degil' }))
     }
 } else { W 'DoH: bu Windows surumunde yok (DNS sifrelenmiyor).' }
-$dns = Test-DnsPoison
-W "discord.com sistem DNS : $($dns.System -join ', ')"
-W "discord.com Cloudflare : $($dns.Doh -join ', ')"
-if ($dns.Poisoned) { Problem 'discord.com icin DNS yanlis adres donduruyor (engelli DNS). Tarayicida ya da VPN/proxy programlarinda ayri DNS ayari olabilir; DNS bolumune bakin.' }
-if (-not $dns.System) { Problem 'discord.com DNS ile cozulemiyor. DoH sunucusuna ulasilamiyor olabilir (otel/okul agi, captive portal).' }
+foreach ($n in 'discord.com', 'roblox.com') {
+    $dns = Test-DnsPoison $n
+    W ("{0,-12} sistem DNS : {1}" -f $n, ($dns.System -join ', '))
+    W ("{0,-12} Cloudflare : {1}" -f $n, ($dns.Doh -join ', '))
+    if ($dns.Poisoned) { Problem "$n icin DNS yanlis adres donduruyor (engelli DNS). Tarayicida ya da VPN/proxy programlarinda ayri DNS ayari olabilir; DNS bolumune bakin." }
+    if (-not $dns.System) { Problem "$n DNS ile cozulemiyor. DoH sunucusuna ulasilamiyor olabilir (otel/okul agi, captive portal)." }
+}
 
 Section 'Baglanti testleri (winws acik haliyle)'
 W "Kontrol ($($Cfg.ControlTarget)): $(if (Test-Url $Cfg.ControlTarget) { 'OK' } else { 'HATA' })"
-foreach ($c in $DiscordChecks) {
-    $ok = Test-Url $c.Url -Tls12:$c.Tls12
-    W ("{0,-32} {1,-8} {2}" -f $c.Url, $(if ($c.Tls12) { 'TLS1.2' } else { 'varsayilan' }), $(if ($ok) { 'OK' } else { 'HATA' }))
+foreach ($g in $Checks.Keys) {
+    $fails = 0
+    foreach ($c in $Checks[$g]) {
+        $ok = Test-Url $c.Url -Tls12:$c.Tls12
+        if (-not $ok) { $fails++ }
+        W ("{0,-8} {1,-32} {2,-10} {3}" -f $g, $c.Url, $(if ($c.Tls12) { 'TLS1.2' } else { 'varsayilan' }), $(if ($ok) { 'OK' } else { 'HATA' }))
+    }
+    if ($fails -and $svc -and $svc.Status -eq 'Running') { Problem "winws calisiyor ama $g testleri basarisiz. select-strategy.cmd ile bu ag icin strateji yeniden secilebilir." }
 }
-$t = Test-Discord
-if ($t.Passed -lt $t.Total -and $svc -and $svc.Status -eq 'Running') { Problem 'winws calisiyor ama Discord testleri basarisiz. select-strategy.cmd ile bu ag icin strateji yeniden secilebilir.' }
 
 Section 'Proxy / VPN'
 $proxy = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
@@ -104,7 +114,7 @@ $il = Get-ChildItem $LogDir -Filter 'install-*.log' -ErrorAction SilentlyContinu
 if ($il) { Get-Content $il.FullName -Tail 25 | ForEach-Object { W $_ } } else { W '(yok)' }
 
 Section 'SONUC'
-if ($problems.Count) { foreach ($p in $problems) { W "- $p" } } else { W 'Belirgin bir sorun bulunamadi. Discord''u sistem tepsisinden tamamen kapatip yeniden acin.' }
+if ($problems.Count) { foreach ($p in $problems) { W "- $p" } } else { W 'Belirgin bir sorun bulunamadi. Discord''u sistem tepsisinden, Roblox''u da tamamen kapatip yeniden acin. Tarayicida "Guvenli DNS" ayari varsa kapatin ya da Cloudflare yapin.' }
 $out | Set-Content -Path $report -Encoding UTF8
 Write-Host ''
 Write-Host "Rapor: $report"

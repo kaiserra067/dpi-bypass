@@ -1,5 +1,5 @@
 <#
-  install.ps1 - Discord icin zapret/winws tabanli DPI bypass kurulumu (YONETICI gerekir).
+  install.ps1 - Discord ve Roblox icin zapret/winws tabanli DPI bypass kurulumu (YONETICI gerekir).
   En kolay yol: install.cmd'ye cift tiklayin.
 
   Yaptiklari (log: C:\ProgramData\dpi-bypass\logs\install-*.log):
@@ -9,7 +9,7 @@
     4. Istenirse kurulum klasorunu Windows Defender taramasindan haric tutar.
     5. Dosyalari C:\Program Files\dpi-bypass altina kopyalar.
     6. Tum fiziksel adaptorlerde DNS'i Cloudflare yapar (IPv4 + IPv6), Windows 11'de DoH'u zorunlu kilar.
-    7. Bu agda Discord'u acan stratejiyi deneyerek bulur.
+    7. Bu agda Discord'u ve Roblox'u acan stratejileri (her biri icin ayri) deneyerek bulur.
     8. winws'i Windows hizmeti, saglik kontrolunu dakikalik gorev olarak kurar.
   Bir adim hata verirse uninstall.ps1 ile her sey geri alinir. Tekrar calistirmak guncelleme yapar.
 
@@ -82,6 +82,15 @@ try {
     }
 
     # --- 2. Calisan DPI araclarini durdur ------------------------------------------
+    # Guncellemede saglik kontrolu, strateji denenirken durdurulan hizmeti yeniden baslatip testleri bozmasin.
+    # Gorev 7. adimda yeniden kaydedilince tekrar etkin olur.
+    foreach ($t in $Cfg.TaskName, $Cfg.ReselectTaskName) {
+        $task = Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
+        if ($task) {
+            if ($task.State -eq 'Running') { Stop-ScheduledTask -TaskName $t }
+            Disable-ScheduledTask -TaskName $t | Out-Null
+        }
+    }
     $ours = Get-Service -Name $Cfg.ServiceName -ErrorAction SilentlyContinue
     if ($ours -and $ours.Status -ne 'Stopped') { Stop-Service -Name $Cfg.ServiceName -Force; Log 'Eski dpi-bypass hizmeti durduruldu (guncelleme).' }
     foreach ($s in $conflicts) {
@@ -111,11 +120,13 @@ try {
                    'uninstall.cmd', 'diagnose.cmd', 'select-strategy.cmd', 'README.md', 'THIRD-PARTY.md', 'LICENSE') {
         Copy-Item -Force (Join-Path $src $f) $InstallDir
     }
-    # hostlist: kullanicinin ekledigi alan adlari korunur, yeni varsayilanlar eklenir.
-    $hlDst = Join-Path $InstallDir 'hostlist.txt'
-    $lines = @(Get-Content (Join-Path $src 'hostlist.txt'))
-    if (Test-Path $hlDst) { $lines = @(Get-Content $hlDst) + $lines }
-    $lines | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique | Set-Content -Path $hlDst -Encoding ASCII
+    # hostlist'ler: kullanicinin ekledigi alan adlari korunur, yeni varsayilanlar eklenir.
+    foreach ($hl in $HostLists.Values) {
+        $hlDst = Join-Path $InstallDir $hl
+        $lines = @(Get-Content (Join-Path $src $hl))
+        if (Test-Path $hlDst) { $lines = @(Get-Content $hlDst) + $lines }
+        $lines | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique | Set-Content -Path $hlDst -Encoding ASCII
+    }
     Start-Sleep -Seconds 2
     $bad = Test-BinFiles $InstallDir
     if ($bad) { throw "Kopyalanan dosyalar silindi/bozuldu: $($bad -join ', '). Antivirus engelliyor olabilir; Defender istisnasina izin vererek tekrar kurun." }
@@ -134,13 +145,14 @@ try {
     }
     $dns = Test-DnsPoison
     if ($dns.Poisoned) { Log "UYARI: discord.com DNS cevabi hatali gorunuyor ($($dns.System -join ',')); DoH sonrasi beklenen: $($dns.Doh -join ',')" }
-    $base = Test-Discord
-    Log "DPI araci olmadan Discord: $($base.Passed)/$($base.Total)"
-    Log 'Stratejiler deneniyor (1-3 dakika surebilir)...'
+    foreach ($r in Test-AllGroups) { Log "DPI araci olmadan: $(Format-GroupResult $r)" }
+    Log 'Stratejiler deneniyor (1-4 dakika surebilir)...'
     $strategy = Find-Strategy
-    if (-not $strategy) { $strategy = @($Strategies.Keys)[0]; Log "UYARI: Hicbir strateji ise yaramadi; varsayilan kuruluyor: $strategy. Saglik kontrolu daha sonra yeniden deneyecek." }
+    foreach ($g in @($strategy.Keys)) {
+        if (-not $strategy[$g]) { $strategy[$g] = @($Strategies.Keys)[0]; Log "UYARI: $g icin hicbir strateji ise yaramadi; varsayilan kuruluyor: $($strategy[$g]). Saglik kontrolu daha sonra yeniden deneyecek." }
+    }
     Save-Strategy $strategy
-    Log "Secilen strateji: $strategy"
+    Log "Secilen strateji: $(Format-Strategy $strategy)"
 
     # --- 7. Hizmet ve gorevler ------------------------------------------------------
     Set-WinwsService $strategy
@@ -165,15 +177,18 @@ try {
 
     # --- 8. Dogrulama -----------------------------------------------------------
     Start-Sleep -Seconds 2
-    $final = Test-Discord
-    Log "Son kontrol: Discord $($final.Passed)/$($final.Total)$(if ($final.Failed) { '  basarisiz: ' + ($final.Failed -join ', ') })"
+    $final = @(Test-AllGroups)
+    foreach ($r in $final) { Log "Son kontrol: $(Format-GroupResult $r)" }
     Log '=== Kurulum tamamlandi.'
     Write-Host ''
-    if ($final.Passed -eq $final.Total) {
-        Write-Host 'Discord erisilebilir durumda. Discord aciksa sistem tepsisinden tamamen kapatip yeniden acin.' -ForegroundColor Green
-    } else {
-        Write-Host 'Kurulum bitti ama Discord testleri tam gecmedi. diagnose.cmd calistirip cikan raporu inceleyin.' -ForegroundColor Yellow
+    foreach ($r in $final) {
+        if ($r.Passed -eq $r.Total) {
+            Write-Host "$($r.Group) erisilebilir durumda." -ForegroundColor Green
+        } else {
+            Write-Host "$($r.Group) testleri tam gecmedi ($($r.Passed)/$($r.Total)). diagnose.cmd calistirip cikan raporu inceleyin." -ForegroundColor Yellow
+        }
     }
+    Write-Host 'Discord veya Roblox aciksa tamamen kapatip yeniden acin (Discord: sistem tepsisinden cikis). Tarayicida Roblox sekmesini yenileyin.'
     Write-Host "Log: $script:LogFile"
 } catch {
     Log "!! KURULUM HATASI: $($_.Exception.Message)"

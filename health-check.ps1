@@ -4,11 +4,11 @@
   Her calismada:
     - winws hizmeti calismiyorsa baslatir.
     - Bagli fiziksel adaptorlerde DNS Cloudflare degilse ayarlar (yeni Wi-Fi karti, USB modem vb.).
-    - DNS, kontrol sitesi (hostlist DISI) ve Discord test edilir.
+    - DNS, kontrol sitesi (hostlist DISI), Discord ve Roblox (config.json: CheckTargets) test edilir.
   Kademeli onarim:
     - Genel sorun (DNS veya kontrol sitesi calismiyor): 1. dakika DNS onbellegi temizlenir,
       2. dakika DNS adaptorlere yeniden uygulanir.
-    - Yalnizca Discord acilmiyor: WinwsRestartAfterMinutes dakika sonra winws yeniden baslatilir.
+    - Yalnizca Discord / Roblox acilmiyor: WinwsRestartAfterMinutes dakika sonra winws yeniden baslatilir.
       Bu ReselectAfterRestarts kez ise yaramazsa strateji yeniden secilir (ag degismis olabilir).
   Log: C:\ProgramData\dpi-bypass\logs\health-YYYYMMDD.log (her calisma bir satir)
 #>
@@ -118,7 +118,7 @@ if (-not $dnsOk -or -not $ctrlOk) {
 $hostStr = ($Cfg.CheckTargets | ForEach-Object { '{0}={1}' -f ([Uri]$_).Host, $(if ($ok[$_]) { 'OK' } else { 'FAIL' }) }) -join ' '
 $line = '{0} svc={1} dns={2}{3} ctrl={4} {5} strateji={6} genFail={7} hostFail={8} restarts={9}{10}' -f `
     (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $svcState, $(if ($dnsOk) { 'OK' } else { 'FAIL' }), $(if ($dnsErr) { "($dnsErr)" } else { '' }),
-    $(if ($ctrlOk) { 'OK' } else { 'FAIL' }), $hostStr, (Get-SavedStrategy), $st.GeneralFails, $st.HostFails, $st.FailedRestarts,
+    $(if ($ctrlOk) { 'OK' } else { 'FAIL' }), $hostStr, (Format-Strategy (Get-SavedStrategy)), $st.GeneralFails, $st.HostFails, $st.FailedRestarts,
     $(if ($actions.Count) { ' ACTION=' + ($actions -join ',') } else { '' })
 Add-Content -Path $logFile -Value $line -Encoding UTF8
 $st | ConvertTo-Json | Set-Content -Path $statePath -Encoding UTF8

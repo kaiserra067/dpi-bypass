@@ -1,5 +1,5 @@
 <#
-  select-strategy.ps1 - Bu agda Discord'u acan stratejiyi yeniden bulur ve kurulu hizmete uygular (YONETICI gerekir).
+  select-strategy.ps1 - Bu agda Discord'u ve Roblox'u acan stratejileri yeniden bulur ve kurulu hizmete uygular (YONETICI gerekir).
   Ag ya da internet saglayicisi degistiginde saglik kontrolu bunu kendiliginden calistirir;
   elle calistirmak icin select-strategy.cmd'ye cift tiklayin.
   Internet yoksa hicbir sey degistirmez.
@@ -11,7 +11,7 @@ Start-Log 'select-strategy'
 
 if (-not (Get-Service -Name $Cfg.ServiceName -ErrorAction SilentlyContinue)) { throw "Kurulu degil. Once install.cmd calistirin." }
 $old = Get-SavedStrategy
-Log "=== Strateji secimi. Mevcut: $old"
+Log "=== Strateji secimi. Mevcut: $(Format-Strategy $old)"
 
 $healthPaused = $false
 try {
@@ -31,21 +31,18 @@ try {
     } else {
         $dns = Test-DnsPoison
         if ($dns.Poisoned) { Log "UYARI: discord.com DNS cevabi hatali gorunuyor ($($dns.System -join ',')). diagnose.cmd calistirin." }
-        $base = Test-Discord
-        Log "DPI araci olmadan Discord: $($base.Passed)/$($base.Total)"
+        foreach ($r in Test-AllGroups) { Log "DPI araci olmadan: $(Format-GroupResult $r)" }
         $new = Find-Strategy
-        if ($new) {
-            Save-Strategy $new
-            if ($new -ne $old) { Set-WinwsService $new }
-            Log "Secilen strateji: $new"
-        } else {
-            Log "Hicbir strateji ise yaramadi; mevcut strateji ($old) korunuyor."
+        foreach ($g in @($new.Keys)) {
+            if (-not $new[$g]) { $new[$g] = $old[$g]; Log "$g icin hicbir strateji ise yaramadi; mevcut strateji ($($old[$g])) korunuyor." }
         }
+        Save-Strategy $new
+        Set-WinwsService $new   # strateji ayni kalsa da config.json (RobloxGameUdp) degismis olabilir
+        Log "Secilen strateji: $(Format-Strategy $new)"
     }
 } finally {
     Get-Process -Name winws -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$InstallDir*" } | Stop-Process -Force -ErrorAction SilentlyContinue
     if (Start-WinwsService) { Log 'winws hizmeti calisiyor.' } else { Log '!! winws hizmeti baslamadi.' }
     if ($healthPaused) { Enable-ScheduledTask -TaskName $Cfg.TaskName | Out-Null }
 }
-$final = Test-Discord
-Log "Son kontrol: Discord $($final.Passed)/$($final.Total)$(if ($final.Failed) { '  basarisiz: ' + ($final.Failed -join ', ') })"
+foreach ($r in Test-AllGroups) { Log "Son kontrol: $(Format-GroupResult $r)" }
